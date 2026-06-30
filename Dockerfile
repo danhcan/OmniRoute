@@ -8,7 +8,7 @@ WORKDIR /app
 # that already have a fix published in trixie. CVEs without an upstream fix yet
 # (local-only TOCTOU, etc.) remain until the distro patches them and the image
 # is rebuilt; none are reachable from the proxy's request surface at runtime.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=shared \
+RUN --mount=type=cache,id=omniroute-apt,target=/var/cache/apt,sharing=shared apt-get update ...
   --mount=type=cache,target=/var/lib/apt/lists,sharing=shared \
   apt-get update \
   && apt-get upgrade -y \
