@@ -8,8 +8,8 @@ WORKDIR /app
 # that already have a fix published in trixie. CVEs without an upstream fix yet
 # (local-only TOCTOU, etc.) remain until the distro patches them and the image
 # is rebuilt; none are reachable from the proxy's request surface at runtime.
-RUN --mount=type=cache,id=omniroute-apt,target=/var/cache/apt,sharing=shared apt-get update ...
-  --mount=type=cache,target=/var/lib/apt/lists,sharing=shared \
+RUN --mount=type=cache,id=cacheKey-omniroute-apt,target=/var/cache/apt,sharing=shared \
+  --mount=type=cache,id=cacheKey-omniroute-apt-lists,target=/var/lib/apt/lists,sharing=shared \
   apt-get update \
   && apt-get upgrade -y \
   && apt-get install -y --no-install-recommends libsecret-1-0 ca-certificates \
@@ -29,8 +29,8 @@ FROM base AS builder
 
 # Build tools for native module compilation
 # apt-get update needed here because base's rm -rf clears the shared cache
-RUN --mount=type=cache,target=/var/cache/apt,sharing=shared \
-  --mount=type=cache,target=/var/lib/apt/lists,sharing=shared \
+RUN --mount=type=cache,id=cacheKey-omniroute-builder-apt,target=/var/cache/apt,sharing=shared \
+  --mount=type=cache,id=cacheKey-omniroute-builder-apt-lists,target=/var/lib/apt/lists,sharing=shared \
   apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ \
   && rm -rf /var/lib/apt/lists/*
@@ -55,7 +55,7 @@ ENV NPM_CONFIG_LEGACY_PEER_DEPS=true
 # are reproducible.
 RUN test -f package-lock.json \
   || (echo "package-lock.json is required for reproducible Docker builds" >&2 && exit 1)
-RUN --mount=type=cache,target=/root/.npm \
+RUN --mount=type=cache,id=cacheKey-omniroute-npm,target=/root/.npm \
   npm ci --no-audit --no-fund --legacy-peer-deps --ignore-scripts \
   && npm rebuild better-sqlite3 \
   && node -e "require('better-sqlite3')(':memory:').close()"
@@ -80,7 +80,7 @@ ARG OMNIROUTE_BUILD_MEMORY_MB=4096
 ENV NODE_OPTIONS="--max-old-space-size=${OMNIROUTE_BUILD_MEMORY_MB}"
 
 COPY . ./
-RUN --mount=type=cache,target=/app/.build/next/cache \
+RUN --mount=type=cache,id=cacheKey-omniroute-next,target=/app/.build/next/cache \
   mkdir -p /app/data && npm run build
 
 # ── Runner base ────────────────────────────────────────────────────────────
@@ -142,66 +142,3 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=15s --retries=3 \
   CMD ["node", "healthcheck.mjs"]
 
 CMD ["node", "dev/run-standalone.mjs"]
-
-# ── Runner Web (web-cookie providers: Gemini Web, Claude Turnstile) ───────────
-#
-#  Two image flavors:
-#    runner-base  →  omniroute:VERSION        Lean base (~500 MB). No browsers.
-#    runner-web   →  omniroute:VERSION-web    +Chromium/Playwright (~800 MB).
-#
-#  Use runner-web when you need web-cookie providers (gemini-web, claude-web,
-#  claude-turnstile). For all other providers runner-base is sufficient.
-#
-#  Build:
-#    docker build --target runner-web -t omniroute:web .
-#  Compose:
-#    build:
-#      context: .
-#      target: runner-web
-FROM runner-base AS runner-web
-
-USER root
-
-# Copy playwright and playwright-core from the builder stage.
-# The slim runtime image does not have playwright in node_modules, so npx falls
-# back to a registry download — unreliable on CI runners (exits 127 on failure).
-# Copying from the builder avoids any network access at image-build time and also
-# ensures the same playwright version is available at runtime for web-session providers.
-COPY --from=builder /app/node_modules/playwright-core ./node_modules/playwright-core
-COPY --from=builder /app/node_modules/playwright ./node_modules/playwright
-
-# Install Playwright browser binaries + OS dependencies under root, then hand
-# ownership of the browsers cache to the node user.
-# PLAYWRIGHT_BROWSERS_PATH overrides the default ~/.cache/ms-playwright so the
-# browsers land under /home/node which persists across image layers and is
-# accessible to the non-root runtime user.
-ENV PLAYWRIGHT_BROWSERS_PATH=/home/node/.cache/ms-playwright
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-  apt-get update \
-  && node node_modules/playwright/cli.js install chromium --with-deps \
-  && chown -R node:node /home/node/.cache \
-  && rm -rf /var/lib/apt/lists/*
-
-USER node
-
-FROM runner-base AS runner-cli
-
-# Drop back to root briefly so we can install system + global npm packages,
-# then return to the `node` non-root user before the CMD inherited from
-# runner-base runs.
-USER root
-
-# Install system dependencies required by openclaw (git+ssh references).
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-  --mount=type=cache,target=/var/lib/apt/lists,sharing=locked \
-  apt-get update \
-  && apt-get install -y --no-install-recommends git ca-certificates docker.io docker-compose \
-  && rm -rf /var/lib/apt/lists/* \
-  && git config --system url."https://github.com/".insteadOf "ssh://git@github.com/"
-
-# Install CLI tools globally. Separate layer from apt for better cache reuse.
-RUN --mount=type=cache,target=/root/.npm \
-  npm install -g --no-audit --no-fund @openai/codex @anthropic-ai/claude-code droid openclaw@latest
-
-USER node
